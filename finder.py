@@ -2,9 +2,11 @@
 
 # Standard library
 import io
+import os
 import math
 import re
 from io import BytesIO
+from pathlib import Path
 
 # Third-party
 import numpy as np
@@ -390,7 +392,7 @@ def parse_args():
     parser.add_argument( "--pa-deg", type=float, default=0.0, help="Position angle in degrees (East of North)")
     parser.add_argument( "--imsize", type=float, default=4.0, help="Image size in arcminutes")
     parser.add_argument("--radius", type=float, default=1.0, help="Radius in arcminutes")
-    parser.add_argument("--output-folder", type=str, default='/Users/tomas.ahumada/AEON/finder_charts/', help="output folder")
+    parser.add_argument("--output-folder", type=str, default='./finder_charts/', help="output folder")
 
     return parser.parse_args()
 
@@ -407,6 +409,8 @@ def main():
     imsize = args.imsize
     radius = args.radius
     output_folder = args.output_folder
+    Path(output_folder).mkdir(parents=True, exist_ok=True)
+
     
     # convert to astropy coords
     ra,dec = parse_coords(ra_,dec_)
