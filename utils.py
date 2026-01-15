@@ -1,62 +1,16 @@
-# ------------------
-# Standard library
-# ------------------
-import io
-import math
-import re
-from io import BytesIO
-
-# ------------------
-# Third-party
-# ------------------
-import numpy as np
-import requests
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-
-# ------------------
-# Astropy
-# ------------------
-import astropy.units as u
-from astropy.coordinates import SkyCoord, Angle
-from astropy.io import fits
-from astropy.time import Time
-from astropy.wcs import WCS
-from astropy.visualization import ImageNormalize, ZScaleInterval
-
-# ------------------
-# Astroquery
-# ------------------
-from astroquery.mast import Catalogs
-from astroquery.gaia import Gaia
-
-# ------------------
-# Reproject
-# ------------------
-from reproject import reproject_interp
-
-# ------------------
-# Matplotlib defaults
-# ------------------
-mpl.rcParams["font.size"] = 15  # default = 10.0
-
-# todo - the finder when applied PA is turned the other way around
-
-# Standard library
 import io
 import os
 import math
 import re
+import logging
 from io import BytesIO
 from pathlib import Path
 
-# Third-party
 import numpy as np
+import requests
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import requests
 
-# Astropy
 import astropy.units as u
 from astropy.coordinates import SkyCoord, Angle
 from astropy.io import fits
@@ -64,21 +18,16 @@ from astropy.time import Time
 from astropy.wcs import WCS
 from astropy.visualization import ImageNormalize, ZScaleInterval
 
-# Reproject
+# Astroquery
+from astroquery.mast import Catalogs
+from astroquery.gaia import Gaia
+from astroquery.skyview import SkyView
+
+# Reprojection
 from reproject import reproject_interp
 
-from astroquery.skyview import SkyView
-from astropy.coordinates import SkyCoord
-import astropy.units as u
-
-
-# # utils
-# from utils import query_stars_gaia, query_stars_ps1, query_stars_ls, get_stars_2mass
-# from utils import get_url, parse_coords
-
-
-import logging
-from pathlib import Path
+# defaults
+mpl.rcParams["font.size"] = 15  # default = 10.0
 
 def setup_logger(
     name="myapp",
