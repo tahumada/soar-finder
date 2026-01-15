@@ -20,7 +20,7 @@ from astropy.visualization import ImageNormalize, ZScaleInterval
 
 # Astroquery
 from astroquery.mast import Catalogs
-from astroquery.gaia import Gaia
+from astroquery.gaiagit  import Gaia
 from astroquery.skyview import SkyView
 
 # Reprojection
