@@ -298,26 +298,37 @@ def fits2image_projected(hdu,pa_deg=0,imsize = 6,radius = 3):
     # compass rose
 
     theta = np.deg2rad(360-pa_deg)
-    length = 60        # arm length in pixels
+    length = 60
     lw = 2.5
     gold = "#E69F00"
-    x0, y0 = int(npixels * 0.1), int(npixels * 0.9)   # choose where to draw the rose
-
-    dx_N =  length * np.sin(theta)
-    dy_N =  length * np.cos(theta)
     
+    x0, y0 = int(npixels * 0.1), int(npixels * 0.87)
+    
+    # Rotation matrix
+    R = np.array([
+        [ np.cos(theta), -np.sin(theta)],
+        [ np.sin(theta),  np.cos(theta)]
+    ])
+    
+    # Unit vectors
+    N0 = np.array([0, 1])
+    E0 = np.array([-1, 0])
+    
+    # Rotated vectors
+    dx_N, dy_N = length * (R @ N0)
+    dx_E, dy_E = length * (R @ E0)
+    
+    # Plot North
     ax.plot([x0, x0 + dx_N], [y0, y0 + dy_N],
             color=gold, lw=lw)
-    ax.text(x0 + dx_N*1.4, y0 + dy_N*1.4, "E",
-            color=gold, ha="center", va="center",rotation=pa_deg )
-
-    dx_E =  length * np.cos(theta)
-    dy_E = -length * np.sin(theta)
+    ax.text(x0 + dx_N*1.4, y0 + dy_N*1.4, "N",
+            color=gold, ha="center", va="center")
     
+    # Plot East
     ax.plot([x0, x0 + dx_E], [y0, y0 + dy_E],
             color=gold, lw=lw)
-    ax.text(x0 + dx_E*1.4, y0 + dy_E*1.4, "N",
-            color=gold, ha="center", va="center",rotation=pa_deg)
+    ax.text(x0 + dx_E*1.4, y0 + dy_E*1.4, "E",
+            color=gold, ha="center", va="center")
     
     return fig
 
