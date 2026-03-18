@@ -1,476 +1,344 @@
-import io
-import os
+# Import mathematics, logging, hashes, paths, and timing tools
 import math
-import re
 import logging
-from io import BytesIO
+import hashlib
 from pathlib import Path
+import time
+from functools import wraps
 
+# Import numerical, request, and astronomical query tools
 import numpy as np
 import requests
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-
+import pyvo
 import astropy.units as u
 from astropy.coordinates import SkyCoord, Angle
 from astropy.io import fits
 from astropy.time import Time
-from astropy.wcs import WCS
-from astropy.visualization import ImageNormalize, ZScaleInterval
-
-# Astroquery
 from astroquery.mast import Catalogs
-from astroquery.gaiagit  import Gaia
+from astroquery.gaia import Gaia
 from astroquery.skyview import SkyView
+from astroquery.irsa import Irsa
 
-# Reprojection
-from reproject import reproject_interp
+# Import Google API libraries
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+from googleapiclient.http import MediaFileUpload
 
-# defaults
-mpl.rcParams["font.size"] = 15  # default = 10.0
-
-def setup_logger(
-    name="myapp",
-    logfile="myapp.log",
-    level=logging.INFO,
-):
+def setup_logger(name="aeon_pipeline", logfile="aeon_pipeline.log", level=logging.INFO):
+    # Ensure the directory for the log file exists
     log_path = Path(logfile)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-
+    
+    # Create the logger object
     logger = logging.getLogger(name)
     logger.setLevel(level)
-
-    # Prevent duplicate handlers if called multiple times
+    
+    # Only add handlers if they don't already exist (prevents duplicate log prints)
     if not logger.handlers:
-        file_handler = logging.FileHandler(log_path, mode="a")  # append
-        formatter = logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(message)s"
-        )
+        file_handler = logging.FileHandler(log_path, mode="a")
+        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
-
     return logger
 
+# Initialize the global logger for utils
+logger = setup_logger(name="utils")
+
+def retry_with_backoff(retries=5, backoff_in_seconds=2):
+    # A Python Decorator to automatically retry a failed function (like a network request)
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            x = 0
+            while True:
+                try:
+                    # Attempt the function execution
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    # If it reaches the max retries, fail and raise the error
+                    if x == retries:
+                        logger.error(f"❌ Failed after {retries} retries: {e}")
+                        raise
+                    
+                    # Calculate wait time: 2s, 4s, 8s, 16s... (Exponential Backoff)
+                    wait = (backoff_in_seconds * 2 ** x)
+                    logger.warning(f"⚠️ Query failed ({e}). Retrying in {wait} seconds...")
+                    time.sleep(wait)
+                    x += 1
+        return wrapper
+    return decorator
 
 def parse_coords(ra_str, dec_str):
-    ra_str = ra_str.strip().lower()
-    dec_str = dec_str.strip().lower()
-
+    # Standardize coordinate strings (lowercase, strip whitespace)
+    ra_str = str(ra_str).strip().lower()
+    dec_str = str(dec_str).strip().lower()
+    
+    # Check if RA is in hours/minutes/seconds format or decimal format
     if ':' in ra_str or any(c in ra_str for c in 'hms'):
         ra = Angle(ra_str, unit=u.hourangle)
     else:
         ra = Angle(float(ra_str), unit=u.deg)
-    
+        
+    # Check if DEC is in degrees/minutes/seconds format or decimal format
     if any(c in dec_str for c in 'dms') or ':' in dec_str:
         dec = Angle(dec_str, unit=u.deg)
     else:
         dec = Angle(float(dec_str), unit=u.deg)
-
+        
+    # Return coordinates in pure decimal degrees
     return ra.deg, dec.deg
 
-def get_url(*args, **kwargs):
-    # Connect and read timeouts
-    kwargs["timeout"] = (6.05, 20)
-    try:
-        return requests.get(*args, **kwargs)
-    except requests.exceptions.RequestException:
-        return None
+def manage_cache_size(cache_dir="./fits_cache", max_size_gb=3.0):
+    # Verify the cache folder exists
+    cache_path = Path(cache_dir)
+    if not cache_path.exists(): return
+    
+    # Convert GB limit to bytes
+    max_size_bytes = max_size_gb * 1024 * 1024 * 1024
+    files, total_size = [], 0
+    
+    # Gather file sizes and modification times
+    for f in cache_path.glob('*'):
+        if f.is_file():
+            size = f.stat().st_size
+            mtime = f.stat().st_mtime
+            files.append((f, size, mtime))
+            total_size += size
+            
+    # If the total size exceeds the limit, delete oldest files first
+    if total_size > max_size_bytes:
+        # Sort by modification time (index 2) ascending (oldest first)
+        files.sort(key=lambda x: x[2])
+        for f, size, mtime in files:
+            try:
+                # Delete the file and subtract its size
+                f.unlink()
+                total_size -= size
+                logger.info(f"Cache management: Deleted {f.name} to free space.")
+                # Stop deleting once we are back under the limit
+                if total_size <= max_size_bytes: break
+            except Exception as e:
+                logger.warning(f"Could not delete cache file {f.name}: {e}")
 
+@retry_with_backoff(retries=3)
+def fetch_fits_cached(url, cache_dir="./fits_cache"):
+    # Ensure cache directory exists
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Generate an MD5 hash of the URL to serve as a unique local filename
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    cache_file = Path(cache_dir) / f"{url_hash}.fits"
+    
+    # If file is already cached locally, open and return it
+    if cache_file.exists(): 
+        return fits.open(cache_file)
         
-##### to query star catalogs
+    # Otherwise, download the file with a 30-second timeout
+    response = requests.get(url, timeout=30)
+    # Validate the response
+    if response is None or response.status_code != 200: return None
+    # Validate it's a true FITS file by checking its header byte signature ('SIMPLE')
+    if not response.content.startswith(b'SIMPLE'): return None
+    
+    # Write to local cache
+    with open(cache_file, 'wb') as f: 
+        f.write(response.content)
+    # Read back and return
+    return fits.open(cache_file)
 
-def query_stars_gaia(ra,dec,radius = 3):
-    '''
-    funtion to perform a cone search of stars from Gaia. Queality check on the photometry embedded in the query.
-    input
-        ra: RA in deg
-        dec: Dec in deg
-        radius: search radius in arcmin
-    returns
-        df: Pandas DataFrame with ra, dec, mag_g, and others (source_id, phot_bp_mean_mag, phot_rp_mean_mag, ruwe)
-    '''
-    
-    coord = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame="icrs")
-    
+@retry_with_backoff()
+def query_stars_gaia(ra, dec, radius=3):
+    # Execute an ADQL (SQL-like) query asynchronously to the Gaia DR3 catalog
+    coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
     query = f"""
-    SELECT
-        source_id,
-        ra,
-        dec,
-        phot_g_mean_mag,
-        phot_bp_mean_mag,
-        phot_rp_mean_mag,
-        ruwe
+    SELECT source_id, ra, dec, pmra, pmdec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag, ruwe
     FROM gaiadr3.gaia_source
-    WHERE 1 = CONTAINS(
-        POINT('ICRS', ra, dec),
-        CIRCLE('ICRS', {coord.ra.deg}, {coord.dec.deg}, {(radius*u.arcmin).to(u.deg).value})
-    )
-    AND ruwe < 1.4
-    AND visibility_periods_used > 8
-    AND astrometric_excess_noise < 1
-    AND phot_bp_rp_excess_factor BETWEEN
-        1.0 + 0.015 * POWER(phot_bp_mean_mag - phot_rp_mean_mag, 2)
-        AND
-        1.3 + 0.06 * POWER(phot_bp_mean_mag - phot_rp_mean_mag, 2)
+    WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {coord.ra.deg}, {coord.dec.deg}, {(radius*u.arcmin).to(u.deg).value}))
+    AND ruwe < 1.4 AND visibility_periods_used > 8 AND astrometric_excess_noise < 1
     ORDER BY phot_g_mean_mag ASC
     """
-    
     job = Gaia.launch_job_async(query)
-    results = job.get_results()
+    df = job.get_results().to_pandas().rename(columns={"phot_g_mean_mag": "mag"})
     
-    results
-    df = results.to_pandas()
-    df.keys()
-    df = df.rename(columns={
-        "phot_g_mean_mag": "mag",
-            })
-
+    # Apply Proper Motion adjustments to move stars from Epoch 2016.0 to current day
+    df['pmra'], df['pmdec'] = df['pmra'].fillna(0), df['pmdec'].fillna(0)
+    dt = Time.now().jyear - 2016.0
+    df['ra'] += (df['pmra'] / np.cos(np.deg2rad(df['dec']))) * dt / 3600000.0
+    df['dec'] += df['pmdec'] * dt / 3600000.0
     return df
 
-def query_stars_ps1(ra,dec,radius = 3):
-    
-    '''
-    funtion to perform a cone search of stars from PS1. Queality check on the photometry embedded in the query.
-    input
-        ra: RA in deg
-        dec: Dec in deg
-        radius: search radius in arcmin
-    returns
-        df: Pandas DataFrame with ra, dec, mag (mag_g), mag_r and others (rKronMag,
-qualityFlag)
-    '''
-    
-    coord = SkyCoord(ra*u.deg,dec*u.deg)
-    
-    tbl = Catalogs.query_region(
-        coord,
-        radius=radius*u.arcmin,
-        catalog="Panstarrs",
-        table="stack",
-        columns=["raMean", "decMean", "gPSFMag", "rPSFMag","rKronMag","qualityFlag"]
-    )
-    
-    tbl = tbl[
-        (tbl["rPSFMag"] < 19) 
-        &
-        (tbl["rPSFMag"] > 14) 
-        &
-        (abs(tbl["rPSFMag"] - tbl["rKronMag"]) < 0.05) 
-        &
-        (tbl["qualityFlag"] < 128)
-    ]
-    
+@retry_with_backoff()
+def query_stars_ps1(ra, dec, radius=3):
+    # Query the Pan-STARRS catalog, filter out galaxies/junk (qualityFlag), sort by magnitude
+    coord = SkyCoord(ra * u.deg, dec * u.deg)
+    tbl = Catalogs.query_region(coord, radius=radius * u.arcmin, catalog="Panstarrs", table="stack", columns=["raMean", "decMean", "gPSFMag", "rPSFMag", "rKronMag", "qualityFlag"])
+    tbl = tbl[(tbl["rPSFMag"] < 19) & (tbl["rPSFMag"] > 14) & (abs(tbl["rPSFMag"] - tbl["rKronMag"]) < 0.05) & (tbl["qualityFlag"] < 128)]
     tbl.sort("rPSFMag")
-    tbl[-1]['rPSFMag']
-    df = tbl.to_pandas()
-    df = df.rename(columns={
-    "raMean": "ra",
-    "decMean": "dec",
-    "gPSFMag": "mag",
-    "rPSFMag": "mag_r"
-        })
-    
-    return df
-    
+    return tbl.to_pandas().rename(columns={"raMean": "ra", "decMean": "dec", "gPSFMag": "mag", "rPSFMag": "mag_r"})
 
-import pyvo
-import astropy.units as u
-from astropy.coordinates import SkyCoord
-import pyvo
-from astropy.table import Table
+@retry_with_backoff()
+def query_stars_ls(ra, dec, radius=6):
+    # Query NOIRLab's Legacy Survey catalog using a TAP service
+    tap_service = pyvo.dal.TAPService("https://datalab.noirlab.edu/tap")
+    query = f"SELECT TOP 100 ra, dec, mag_g, mag_r, mag_z FROM ls_dr10.tractor WHERE type = 'PSF' AND ra BETWEEN {ra - radius/2/60} AND {ra + radius/2/60} AND dec BETWEEN {dec - radius/2/60} AND {dec + radius/2/60} AND mag_r < 18"
+    return tap_service.run_async(query, language="ADQL").to_table().to_pandas().rename(columns={"mag_g": "mag"})
 
-def query_stars_ls(ra,dec,radius = 6):
-    '''
-    funtion to perform a box search of stars from Legacy Survey. Queality check on the photometry embedded in the query.
-    input    
-        ra: RA in deg
-        dec: Dec in deg
-        radius: size of the box in arcmin
-    returns
-        df: Pandas DataFrame with ra, dec, mag (mag_g), mag_r, mag_z
-    '''
-    
-    
-    # TAP service URL
-    tap_url = "https://datalab.noirlab.edu/tap"
-    
-    # Create TAP service object
-    tap_service = pyvo.dal.TAPService(tap_url)
-    
-    query = f"""
-    SELECT TOP 100
-        ra, dec,
-        mag_g, mag_r, mag_z
-    FROM ls_dr10.tractor
-    WHERE
-        type = 'PSF' 
-        AND ra BETWEEN {ra-radius/2/60} AND {ra+radius/2/60}
-        AND dec BETWEEN {dec-radius/2/60} AND {dec+radius/2/60}
-        AND mag_r < 18
-    """
-    
-    job = tap_service.run_async(query, language="ADQL")
-    results = job.to_table()
-    
-    df = results.to_pandas()
-    df = df.rename(columns={
-        "mag_g": "mag",
-            })
-    
-    
-    return df
+@retry_with_backoff()
+def get_stars_2mass(ra, dec, radius=2):
+    # Query the 2MASS Infrared catalog, keeping only cleanly detected stars (ph_qual 'A' or 'B')
+    target = SkyCoord(ra * u.deg, dec * u.deg, frame="icrs")
+    tbl = Irsa.query_region(target, radius=radius * u.arcmin, catalog="fp_psc")["ra", "dec", "j_m", "j_cmsig", "ph_qual", "cc_flg"]
+    good = np.array([ph_qa[0] in ['A', 'B'] for ph_qa in tbl["ph_qual"]])
+    return tbl[good].to_pandas().rename(columns={"j_m": "mag"})
 
-def get_stars_2mass(ra,dec,radius=2):
-
-    from astroquery.irsa import Irsa
-    from astropy.coordinates import SkyCoord
-    import astropy.units as u
-    
-    # Target position
-    target = SkyCoord(ra*u.deg, dec*u.deg, frame="icrs")
-        
-    # Query 2MASS Point Source Catalog
-    tbl = Irsa.query_region(
-        target,
-        radius=radius* u.arcmin,
-        catalog="fp_psc"   # 2MASS Point Source Catalog
-    )
-    
-    # Extract J-band photometry
-    tbl = tbl["ra", "dec", "j_m", "j_cmsig", "ph_qual", "cc_flg"]
-    
-    good = np.array([ph_qa[0] =='A' or ph_qa[0] =='B' for ph_qa in tbl["ph_qual"]]) #* np.array([ph_qa[0] =='0' for ph_qa in tbl["cc_flg"]])    
-    
-    clean = tbl[good]
-    
-    df = clean.to_pandas()
-    df = df.rename(columns={
-        "j_m": "mag",
-            })
-    
-    
-    return df
-
-
-def get_image_ps1(ra,dec,source_name,imsize=6):
-    
-    url = (
-            f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
-            f"?width=500&height=500&fov={imsize/60}&ra={ra}&dec={dec}"
-            f"&hips=CDS/P/PanSTARRS/DR1/r"
-        )
-    
-    response = requests.get(url, timeout=30)
-    hdu = fits.open(BytesIO(response.content))
-    
-    npixels = len(hdu[0].data)
-    pixscale = imsize*60/npixels
-    
-    if response is None or response.status_code != 200:
-            print('failed PS1 retrieval')
-            return ''
-        
-        
-    hdu = fits.open(BytesIO(response.content))
-    if len(hdu) == 0:
-        print('failed PS1 retrieval')
-        return ''
-        
-    hdu[0].header['watermark'] =  'PS1'
-    hdu[0].header['pixscale'] =  pixscale
-    hdu[0].header['imsize'] =  imsize
-    hdu[0].header['source_name'] =  source_name
-    hdu[0].header['ra'] =  ra
-    hdu[0].header['dec'] =  dec
-    hdu[0].header['numpix'] = npixels
-
+def populate_header(hdu, w_mark, pixscale, imsize, s_name, ra, dec, npixels):
+    # Helper function to standardize FITS headers across different image surveys
+    for k, v in zip(['w_mark', 'pixscale', 'imsize', 's_name', 'ra', 'dec', 'numpix'], [w_mark, pixscale, imsize, s_name, ra, dec, npixels]):
+        hdu[0].header[k] = v
     return hdu
 
+def get_image_ps1(ra, dec, s_name, imsize=6):
+    # Fetch Pan-STARRS image tile
+    url = f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits?width=500&height=500&fov={imsize/60}&ra={ra}&dec={dec}&hips=CDS/P/PanSTARRS/DR1/r"
+    hdu = fetch_fits_cached(url)
+    if not hdu or len(hdu) == 0: return ''
+    return populate_header(hdu, 'PS1', imsize * 60 / len(hdu[0].data), imsize, s_name, ra, dec, len(hdu[0].data))
 
-def get_image_ls(ra,dec,source_name,
-                  imsize = 6# in arcmin
-                 ):
-    
-    pixscale = 0.26
-    LS_CUTOUT_TIMEOUT = 30
-    
-    numpix = math.ceil(60 * imsize / pixscale)
-    
-    ls_query_url = (
-         f"http://legacysurvey.org/viewer/fits-cutout/"
-         f"?ra={ra}&dec={dec}&layer=dr8&pixscale={pixscale}&bands=r&size={numpix}"
-    )
-    print(ls_query_url)
-    
-    response = requests.get(ls_query_url, timeout=LS_CUTOUT_TIMEOUT)
-    if response is None or response.status_code != 200:
-        print('failed')
-        return ''
-    
-    
-    hdu = fits.open(BytesIO(response.content))
-    if len(hdu) == 0:
-        print('failed')
-        return ''
-        
-    hdu[0].header['watermark'] =  'LS'
-    hdu[0].header['pixscale'] =  pixscale
-    hdu[0].header['imsize'] =  imsize
-    hdu[0].header['source_name'] =  source_name
-    hdu[0].header['ra'] =  ra
-    hdu[0].header['dec'] =  dec
-    hdu[0].header['numpix'] =  numpix
+def get_image_ls(ra, dec, s_name, imsize=6):
+    # Fetch NOIRLab Legacy Survey image tile
+    numpix = math.ceil(60 * imsize / 0.26)
+    url = f"http://legacysurvey.org/viewer/fits-cutout/?ra={ra}&dec={dec}&layer=dr8&pixscale=0.26&bands=r&size={numpix}"
+    hdu = fetch_fits_cached(url)
+    if not hdu or len(hdu) == 0: return ''
+    return populate_header(hdu, 'LS', 0.26, imsize, s_name, ra, dec, numpix)
 
-    return hdu
+def get_image_decaps(ra, dec, s_name, imsize=6):
+    # Fetch DECaPS image tile
+    numpix = math.ceil(60 * imsize / 0.26)
+    url = f"http://legacysurvey.org/viewer/fits-cutout/?layer=decaps2&ra={ra}&dec={dec}&pixscale=0.26&bands=r&size={numpix}"
+    hdu = fetch_fits_cached(url)
+    if not hdu or len(hdu) == 0: return ''
+    return populate_header(hdu, 'LS', 0.26, imsize, s_name, ra, dec, numpix)
 
-def get_image_decaps(ra,dec,source_name,
-                  imsize = 6# in arcmin
-                 ):
-    
-    pixscale = 0.26
-    DECAPS_CUTOUT_TIMEOUT = 30
-    
-    numpix = math.ceil(60 * imsize / pixscale)
-    
-    decaps_query_url = (
-         f"http://legacysurvey.org/viewer/fits-cutout/?layer=decaps2&"
-         f"ra={ra}&dec={dec}&pixscale={pixscale}&bands=r&size={numpix}"
-    )
-    print(decaps_query_url)
-    
-    response = requests.get(decaps_query_url, timeout=DECAPS_CUTOUT_TIMEOUT)
-    if response is None or response.status_code != 200:
-        print('failed')
-        return ''
-    
-    
-    hdu = fits.open(BytesIO(response.content))
-    if len(hdu) == 0:
-        print('failed')
-        return ''
-        
-    hdu[0].header['watermark'] =  'LS'
-    hdu[0].header['pixscale'] =  pixscale
-    hdu[0].header['imsize'] =  imsize
-    hdu[0].header['source_name'] =  source_name
-    hdu[0].header['ra'] =  ra
-    hdu[0].header['dec'] =  dec
-    hdu[0].header['numpix'] =  numpix
-
-    return hdu
-
-def get_image_dss(ra,dec,source_name,
-                  imsize = 6# in arcmin
-                 ):
-    
+def get_image_dss(ra, dec, s_name, imsize=6):
+    # Fetch Digitized Sky Survey (DSS) image tile as a final fallback
     url = f"http://archive.stsci.edu/cgi-bin/dss_search?v=poss2ukstu_red&r={ra}&dec={dec}&h={imsize}&w={imsize}&e=J2000"
-    response = requests.get(url, timeout=30)
-    hdu = fits.open(BytesIO(response.content))
+    hdu = fetch_fits_cached(url)
+    if not hdu or len(hdu) == 0: return ''
+    return populate_header(hdu, 'DSS', imsize * 60 / len(hdu[0].data), imsize, s_name, ra, dec, len(hdu[0].data))
+
+def get_image_2mass(ra, dec, s_name, imsize=6):
+    # Attempt to fetch 2MASS image from SkyView
+    url = f"https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl?Position={ra},{dec}&Survey=2MASS-J&Radius={imsize/60}&Return=FITS"
+    hdu = fetch_fits_cached(url)
     
+    # If the direct URL fails, use astroquery's SkyView wrapper as a fallback
+    if not hdu or len(hdu) == 0:
+        try:
+            images = SkyView.get_images(position=SkyCoord(ra * u.deg, dec * u.deg, frame="icrs"), survey=["2MASS-J"], radius=imsize * u.arcmin, pixels=500)
+            if not images: return ''
+            hdu = images[0]
+        except: return ''
+        
     npixels = len(hdu[0].data)
-    imsize = imsize
-    pixscale = imsize*60/npixels
-    
-    if response is None or response.status_code != 200:
-            print('failed DSS retrieval')
-            return ''
-        
-        
-    hdu = fits.open(BytesIO(response.content))
-    if len(hdu) == 0:
-        print('failed DSS retrieval')
+    im = hdu[0].data
+    # Reject the image if the central portion is entirely full of NaN (empty space)
+    cent, width = int(npixels / 2), int(0.05 * npixels)
+    test_slice = slice(cent - width, cent + width)
+    if np.isnan(im[test_slice, test_slice].flatten()).all() or (im[test_slice, test_slice].flatten() == 0).all(): 
         return ''
         
-    hdu[0].header['watermark'] =  'DSS'
-    hdu[0].header['pixscale'] =  pixscale
-    hdu[0].header['imsize'] =  imsize
-    hdu[0].header['source_name'] =  source_name
-    hdu[0].header['ra'] =  ra
-    hdu[0].header['dec'] =  dec
-    hdu[0].header['numpix'] =  len(hdu[0].data)
+    return populate_header(hdu, '2MASS', imsize * 60 / npixels, imsize, s_name, ra, dec, npixels)
 
-    return hdu
-
-def get_image_2mass(ra,dec,source_name,
-                  imsize = 6# in arcmin
-                 ):
-    
-    url = (
-    "https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl?"
-    f"Position={ra},{dec}"
-    "&Survey=2MASS-J"
-    f"&Radius={imsize/60}"   # degrees = 5 arcmin
-    "&Return=FITS"
-    )
-
-    response = requests.get(url, timeout=30)
-    hdu = fits.open(BytesIO(response.content))
-    
-    npixels = len(hdu[0].data)
-    pixscale = imsize*60/npixels
-    
-    if response is None or response.status_code != 200:
-            print('failed 2MASS retrieval')
-            return ''
-        
-        
-    hdu = fits.open(BytesIO(response.content))
-    im = hdu[0].data
-    cent = int(npixels / 2)
-    width = int(0.05 * npixels)
-    test_slice = slice(cent - width, cent + width)
-    all_nans = np.isnan(im[test_slice, test_slice].flatten()).all()
-    all_zeros = (im[test_slice, test_slice].flatten() == 0).all()
-  
-    if len(hdu) == 0 or all_zeros or all_nans:
-        print('failed 2MASS retrieval, trying again')
-        
-        coord = SkyCoord(ra*u.deg, dec*u.deg, frame="icrs")
-        images = SkyView.get_images(
-            position=coord,
-            survey=["2MASS-J"],   # 2MASS-J, 2MASS-H, 2MASS-K
-            radius=imsize * u.arcmin,
-            pixels=npixels
-        )
-        hdu = images[0]
+def get_image_fallbacks(ra, dec, s_name, imsize=5):
+    # Helper to validate if a returned image is usable (not completely black/NaN)
+    def is_valid(hdu):
+        if not hdu or len(hdu) == 0 or hdu[0].data is None: return False
         im = hdu[0].data
-        all_nans = np.isnan(im[test_slice, test_slice].flatten()).all()
-        all_zeros = (im[test_slice, test_slice].flatten() == 0).all()
-        if len(im) == 0 or all_zeros or all_nans:
-            return ''
+        if np.all(np.isnan(im)) or np.all(im == 0) or (np.isnan(im).sum() / im.size > 0.90): return False
+        return True
+
+    # Loop through optical surveys in preference order until a valid image is found
+    for func in [get_image_ls, get_image_ps1, get_image_decaps, get_image_dss]:
+        hdu = func(ra, dec, s_name, imsize=imsize)
+        if is_valid(hdu): return hdu
+    # Raise error if no survey has coverage here
+    raise TypeError("Could not get a valid optical image.")
+
+# Define a global variable to hold the Google Drive service instance (Singleton)
+_drive_service_instance = None
+
+def _get_drive_service(credentials_file="drive_credentials.json"):
+    # Reference the global variable
+    global _drive_service_instance
+    
+    # If it's already authenticated, reuse it immediately (saves time/API quota)
+    if _drive_service_instance is not None:
+        return _drive_service_instance
         
-    hdu[0].header['watermark'] =  '2MASS'
-    hdu[0].header['pixscale'] =  pixscale
-    hdu[0].header['imsize'] =  imsize
-    hdu[0].header['source_name'] =  source_name
-    hdu[0].header['ra'] =  ra
-    hdu[0].header['dec'] =  dec
-    hdu[0].header['numpix'] = npixels
-
-    return hdu
-
-def get_image_fallbacks(ra,dec,source_name,imsize = 5):
-    hdu = get_image_ls(ra,dec,source_name,imsize = imsize)
-    if hdu != '':
-        print('image from LS')
-    
-    if hdu == '':
-        hdu = get_image_ps1(ra,dec,source_name,imsize = imsize)
-        if hdu != '':
-            print('image from PS1')
+    # Check if credentials file exists
+    if not Path(credentials_file).exists():
+        logger.warning(f"Drive credentials '{credentials_file}' not found.")
+        return None
         
-    if hdu == '':
-        hdu = get_image_decaps(ra,dec,source_name,imsize = imsize)
-        if hdu != '':
-            print('image from DECaPs')
+    try:
+        # Load the Service Account credentials with read/write scopes
+        creds = service_account.Credentials.from_service_account_file(credentials_file, scopes=['https://www.googleapis.com/auth/drive.metadata.readonly', 'https://www.googleapis.com/auth/drive.file'])
+        # Build the service object and store it in the global instance
+        _drive_service_instance = build('drive', 'v3', credentials=creds)
+        return _drive_service_instance
+    except Exception as e:
+        logger.error(f"Error authenticating with Google Drive: {e}")
+        return None
 
-    if hdu == '':
-        hdu = get_image_dss(ra,dec,source_name,imsize = imsize)
-        if hdu != '':
-            print('image from DSS')
-    
-    if hdu == '':
-        raise TypeError("could not get image, tried LS, PS1, DECaPs, and DSS")
-    
-    return hdu
+def upload_to_drive(file_path, folder_id, credentials_file="drive_credentials.json"):
+    # Grab the authenticated service
+    service = _get_drive_service(credentials_file)
+    if not service: return None
+    try:
+        # Prepare the file metadata and media upload object
+        file_name = Path(file_path).name
+        media = MediaFileUpload(str(file_path), mimetype='application/pdf', resumable=True)
+        logger.info(f"Uploading {file_name} to Google Drive...")
+        
+        # Execute the upload (supportsAllDrives=True allows uploading to Shared Team Drives)
+        file = service.files().create(body={'name': file_name, 'parents': [folder_id]}, media_body=media, fields='id', supportsAllDrives=True).execute()
+        logger.info(f"Upload successful! Drive ID: {file.get('id')}")
+        return file.get('id')
+    except Exception as e:
+        logger.error(f"Error uploading to Google Drive: {e}")
+        return None
+
+def check_file_in_drive(file_name, folder_id, credentials_file="drive_credentials.json"):
+    # Grab the authenticated service
+    service = _get_drive_service(credentials_file)
+    if not service: return False
+    try:
+        # Search the drive folder for a file matching the exact name
+        results = service.files().list(q=f"name='{file_name}' and '{folder_id}' in parents and trashed=false", spaces='drive', fields='files(id, name)', includeItemsFromAllDrives=True, supportsAllDrives=True).execute()
+        # Return True if 1 or more files are found
+        return len(results.get('files', [])) > 0
+    except Exception as e:
+        logger.error(f"Error querying Google Drive: {e}")
+        return False
+
+def get_or_create_drive_folder(folder_name, parent_folder_id, credentials_file="drive_credentials.json"):
+    # Grab the authenticated service
+    service = _get_drive_service(credentials_file)
+    if not service: return None
+    try:
+        # Check if the subfolder already exists in the parent folder
+        results = service.files().list(q=f"name='{folder_name}' and '{parent_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", spaces='drive', fields='files(id, name)', includeItemsFromAllDrives=True, supportsAllDrives=True).execute()
+        items = results.get('files', [])
+        
+        # If found, return its ID
+        if items: 
+            return items[0]['id']
+        
+        # If not found, create a new folder with that name
+        folder = service.files().create(body={'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_folder_id]}, fields='id', supportsAllDrives=True).execute()
+        logger.info(f"Created new Drive subfolder: {folder_name}")
+        return folder.get('id')
+    except Exception as e:
+        logger.error(f"Error managing Google Drive folder: {e}")
+        return None
