@@ -1,0 +1,6 @@
+name: finder
+dependencies:
+  - python=3.10  # Change this to your desired version
+  - pip
+  - pip:
+    - -r requirements.txt
