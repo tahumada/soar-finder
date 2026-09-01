@@ -77,7 +77,7 @@ def main():
                     radius=1.0, # Default star search radius
                     contrast=contrast_value,
                     output_folder='./finder_charts/',
-                    drive_folder=args.drive_folder
+                    drive_folder=args.drive_folder,
                 )
             except Exception as e:
                 print(f"❌ Failed to process {s_name} completely: {e}")

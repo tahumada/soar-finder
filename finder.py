@@ -273,37 +273,26 @@ def fits2image_projected(hdu_opt, hdu_ir, stars_opt, stars_ir, pa_deg=0, imsize=
                 
                 ew_dir = 'W' if row.offset_EW_arcsec >= 0 else 'E'
                 ns_dir = 'S' if row.offset_NS_arcsec >= 0 else 'N'
-                y_pos = text_y_start - 0.10 - (i * 0.045)
+                
+                # Increased the vertical gap to fit the new coordinate line below the offsets
+                y_pos_main = text_y_start - 0.10 - (i * 0.09)
+                y_pos_coords = y_pos_main - 0.04
                 
                 # Column 1: Star Label
-                ax_text.text(0.00, y_pos, rf"$\bf{{{prefix_dir}{i+1}}}$", color=colors[i], fontsize=13)
+                ax_text.text(0.00, y_pos_main, rf"$\bf{{{prefix_dir}{i+1}}}$", color=colors[i], fontsize=13)
                 # Column 2: Magnitude
-                ax_text.text(0.10, y_pos, f"{row.mag:.1f}m", color=colors[i], fontsize=13)
-                # Column 3: EW Offset (Bold and slightly larger to stand out)
-                ax_text.text(0.35, y_pos, rf"$\bf{{{abs(row.offset_EW_arcsec):.1f}''\ {ew_dir}}}$", color=colors[i], fontsize=14)
-                # Column 4: NS Offset (Bold and slightly larger to stand out)
-                ax_text.text(0.70, y_pos, rf"$\bf{{{abs(row.offset_NS_arcsec):.1f}''\ {ns_dir}}}$", color=colors[i], fontsize=14)
+                ax_text.text(0.10, y_pos_main, f"{row.mag:.1f}m", color=colors[i], fontsize=13)
+                # Column 3: EW Offset
+                ax_text.text(0.35, y_pos_main, rf"$\bf{{{abs(row.offset_EW_arcsec):.1f}''\ {ew_dir}}}$", color=colors[i], fontsize=14)
+                # Column 4: NS Offset
+                ax_text.text(0.70, y_pos_main, rf"$\bf{{{abs(row.offset_NS_arcsec):.1f}''\ {ns_dir}}}$", color=colors[i], fontsize=14)
+                
+                # New Column/Row: Star Coordinates
+                ax_text.text(0.10, y_pos_coords, f"RA: {row.ra:.5f}°, Dec: {row.dec:.5f}°", color=colors[i], fontsize=11)
 
-            # --- ROTATED OFFSETS INFO (Table Format) ---
-            ax_text.text(0, text_y_start - 0.26, f"{num_rot} - Rotated Offsets (PA: {(pa_deg + 180) % 360}°):", color=color_rot, fontweight="bold", fontsize=11)
-            for i, (_, row) in enumerate(top3.iterrows()):
-                sx, sy = wcs.world_to_pixel(SkyCoord(row.ra * u.deg, row.dec * u.deg, frame="icrs"))
-                draw_crosshair(ax_rot, sx, sy, gap=s_gap, arm=s_arm, color=colors[i], label=f"{prefix_rot}{i+1}", label_offset=t_offset)
-                
-                ew_rot = 'E' if row.offset_EW_arcsec >= 0 else 'W'
-                ns_rot = 'N' if row.offset_NS_arcsec >= 0 else 'S'
-                y_pos = text_y_start - 0.31 - (i * 0.045)
-                
-                # Column 1: Star Label
-                ax_text.text(0.00, y_pos, rf"$\bf{{{prefix_rot}{i+1}}}$", color=colors[i], fontsize=13)
-                # Column 2: Magnitude
-                ax_text.text(0.10, y_pos, f"{row.mag:.1f}m", color=colors[i], fontsize=13)
-                # Column 3: EW Offset (Bold and slightly larger to stand out)
-                ax_text.text(0.35, y_pos, rf"$\bf{{{abs(row.offset_EW_arcsec):.1f}''\ {ew_rot}}}$", color=colors[i], fontsize=14)
-                # Column 4: NS Offset (Bold and slightly larger to stand out)
-                ax_text.text(0.70, y_pos, rf"$\bf{{{abs(row.offset_NS_arcsec):.1f}''\ {ns_rot}}}$", color=colors[i], fontsize=14)
-                
-            return text_y_start - 0.48
+            # Adjusted return height since the rotated block was deleted
+            return text_y_start - 0.35
+            
         return text_y_start
 
     # Adjust starting Y position to accommodate larger Target header
@@ -337,9 +326,9 @@ def run_pipeline(s_name, ra_str, dec_str, pa_deg=0.0, imsize=4.0, radius=1.0, co
     with ThreadPoolExecutor(max_workers=4) as executor:
         # Launch all 4 tasks concurrently
         future_opt_img = executor.submit(get_image_fallbacks, ra, dec, s_name, download_imsize)
-        future_ir_img = executor.submit(get_image_2mass, ra, dec, s_name, download_imsize)
+        # future_ir_img = executor.submit(get_image_2mass, ra, dec, s_name, download_imsize)
         future_opt_stars = executor.submit(get_stars, ra, dec, radius, 'optical')
-        future_ir_stars = executor.submit(get_stars, ra, dec, radius, 'ir')
+        # future_ir_stars = executor.submit(get_stars, ra, dec, radius, 'ir')
         
         # Retrieve Optical Results
         try:
@@ -352,23 +341,24 @@ def run_pipeline(s_name, ra_str, dec_str, pa_deg=0.0, imsize=4.0, radius=1.0, co
             print(f"Warning: Could not fetch optical image or stars. {e}")
             
         # Retrieve IR Results
-        try:
-            hdu_ir = future_ir_img.result()
-            if hdu_ir:
-                hdu_ir[0].header['wv'] = 'ir'
-                print("Infrared image fetched successfully from 2MASS")
-            stars_ir = future_ir_stars.result()
-        except Exception as e:
-            print(f"Warning: Could not fetch 2MASS image or stars. {e}")
+        # try:
+        #     hdu_ir = future_ir_img.result()
+        #     if hdu_ir:
+        #         hdu_ir[0].header['wv'] = 'ir'
+        #         print("Infrared image fetched successfully from 2MASS")
+        #     stars_ir = future_ir_stars.result()
+        # except Exception as e:
+        #     print(f"Warning: Could not fetch 2MASS image or stars. {e}")
     # ------------------------------------------------------------------
 
     if not hdu_opt and not hdu_ir:
         raise ValueError("Could not fetch ANY images for this target.")
             
     print("Generating Finder Chart PDF...")
-    fig = fits2image_projected(hdu_opt, hdu_ir, stars_opt, stars_ir, pa_deg=pa_deg, imsize=imsize, radius=radius, contrast=contrast)
+    # fig = fits2image_projected(hdu_opt, hdu_ir, stars_opt, stars_ir, pa_deg=pa_deg, imsize=imsize, radius=radius, contrast=contrast)
+    fig = fits2image_projected(hdu_opt, hdu_opt, stars_opt, stars_opt, pa_deg=pa_deg, imsize=imsize, radius=radius, contrast=contrast)
     
-    output_file = Path(output_folder) / f'finder_{s_name}.pdf'
+    output_file = Path(output_folder) / f'{s_name}.pdf'
     fig.savefig(output_file, format="pdf", bbox_inches="tight", pad_inches=0.02)
     print(f"Success! PDF saved to: {output_file}")
     
